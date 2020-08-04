@@ -15,4 +15,5 @@
 	<templateProperties value="id=simple_peripheral_app_CC26X2R1_LAUNCHXL_tirtos_ccs.projectspec.simple_peripheral_app_CC26X2R1_LAUNCHXL_tirtos_ccs,type=rtsc,xdcToolsVersion=3_60_02_34_core,target=ti.targets.arm.elf.M4F,platform=ti.platforms.simplelink:CC2642R1F,buildProfile=release,isHybrid=true,configuroOptions= --compileOptions &quot;${COMPILER_FLAGS} &quot;"/>
 	<origin value="C:/Github/HET2_Software/custom_peripheral_base"/>
 	<filesToOpen value=""/>
+	<isTargetManual value="false"/>
 </projectOptions>
