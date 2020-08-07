@@ -2519,6 +2519,7 @@ static void CustomPeripheral_performPeriodicTask(void)
     CUSTOM_SetParameter(CHAR4_ID, CHAR4_LEN, NULL);
     CUSTOM_SetParameter(CHAR5_ID, CHAR5_LEN, NULL);
     i++;
+    if(i==100) i = 0;
 }
 
 
