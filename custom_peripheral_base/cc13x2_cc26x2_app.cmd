@@ -2,8 +2,8 @@
 
  @file  cc13x2_cc26x2_app.cmd
 
- @brief CC26X2R1F and CC13X2R1F3 linker configuration file for TI-RTOS with Code
-        Composer Studio.
+ @brief CC2650F128 linker configuration file for TI-RTOS with Code Composer
+        Studio.  For use with OAD on chip applications (Image A or B).
 
         Imported Symbols
         Note: Linker defines are located in the CCS IDE project by placing them
@@ -12,10 +12,13 @@
 
         CACHE_AS_RAM:       Disable system cache to be used as GPRAM for
                             additional volatile memory storage.
-        FLASH_ROM_BUILD:	If defined, it should be set to 1 or 2 to indicate
+        FLASH_ROM_BUILD:    If defined, it should be set to 1 or 2 to indicate
                             the ROM version of the device being used. When using
                             Flash-only configuration, this symbol should not be
                             defined.
+
+        IMAGE_A:            Fixed Image A build.  When not present, it is
+                            assumed to be an Image B build.
         ICALL_RAM0_START:   RAM start of BLE stack.
         ICALL_STACK0_START: Flash start of BLE stack.
         PAGE_AlIGN:         Align BLE stack boundary to a page boundary.
@@ -76,7 +79,7 @@
 --diag_suppress=10063,16011,16012
 
 /* The following command line options are set as part of the CCS project.    */
-	/* If you are building using the command line, or for some reason want to    */
+/* If you are building using the command line, or for some reason want to    */
 /* define them here, you can uncomment and modify these lines as needed.     */
 /* If you are using CCS for building, it is probably better to make any such */
 /* modifications in your CCS project and leave this file alone.              */
@@ -91,6 +94,7 @@
 /*******************************************************************************
  * Memory Sizes
  */
+
 #define FLASH_BASE   0x00000000
 #define GPRAM_BASE   0x11000000
 #define RAM_BASE     0x20000000
@@ -126,8 +130,10 @@
 #endif // FLASH_ROM_BUILD
 
 #define RAM_START      (RAM_BASE + RESERVED_RAM_SIZE_AT_START)
+
+
 #ifdef ICALL_RAM0_START
-  #define RAM_END      (ICALL_RAM0_START - 1)
+  #define RAM_END             (ICALL_RAM0_START - 1)
 #else
   #define RAM_END      (RAM_BASE + RAM_SIZE - RESERVED_RAM_SIZE_AT_END - 1)
 #endif /* ICALL_RAM0_START */
@@ -140,7 +146,7 @@
  * Flash
  */
 
-#define FLASH_START                FLASH_BASE
+
 #define WORD_SIZE                  4
 
 #define PAGE_SIZE                  0x2000
@@ -157,23 +163,31 @@
 #define NUM_RESERVED_FLASH_PAGES   1
 #define RESERVED_FLASH_SIZE        (NUM_RESERVED_FLASH_PAGES * PAGE_SIZE)
 
-/* Check if page alingment with the Stack image is required.  If so, do not link
- * into a page shared by the Stack.
- */
-#ifdef ICALL_STACK0_START
-  #ifdef PAGE_ALIGN
-    #define ADJ_ICALL_STACK0_START (ICALL_STACK0_START * PAGE_MASK)
-  #else
-    #define ADJ_ICALL_STACK0_START ICALL_STACK0_START
-  #endif /* PAGE_ALIGN */
-
-  #define FLASH_END                (ADJ_ICALL_STACK0_START - 1)
+#ifdef SECURITY
+  #define  OAD_HDR_SIZE            0x90
 #else
+  #define  OAD_HDR_SIZE            0x50
+#endif
+
+#ifdef OAD_IMG_A
+  #define FLASH_START              0
+  #define ENTRY_SIZE               0x40
+  #define ENTRY_END                FLASH_START + FLASH_SIZE - RESERVED_FLASH_SIZE - 1
+  #define ENTRY_START              ENTRY_END - ENTRY_SIZE +1
+
+  #define FLASH_END                ENTRY_START - 1
+#else
+  #define  OAD_HDR_START           0
+  #define  OAD_HDR_END             OAD_HDR_START + OAD_HDR_SIZE - 1
+
+  #define ENTRY_START              OAD_HDR_END + 1
+  #define ENTRY_SIZE               0x40
+  #define ENTRY_END                ENTRY_START + ENTRY_SIZE - 1
+
+  #define FLASH_START              ENTRY_END + 1
   #define FLASH_END                (FLASH_BASE + FLASH_SIZE - RESERVED_FLASH_SIZE - 1)
-#endif /* ICALL_STACK0_START */
-
-#define FLASH_LAST_PAGE_START      (FLASH_SIZE - PAGE_SIZE)
-
+  #define FLASH_LAST_PAGE_START    FLASH_END + 1
+#endif
 /*******************************************************************************
  * Stack
  */
@@ -181,34 +195,6 @@
 /* Create global constant that points to top of stack */
 /* CCS: Change stack size under Project Properties    */
 __STACK_TOP = __stack + __STACK_SIZE;
-
-/*******************************************************************************
- * GPRAM
- */
-
-#ifdef CACHE_AS_RAM
-  #define GPRAM_START GPRAM_BASE
-  #define GPRAM_END   (GPRAM_START + GPRAM_SIZE - 1)
-#endif /* CACHE_AS_RAM */
-
-/*******************************************************************************
- * ROV
- * These symbols are used by ROV2 to extend the valid memory regions on device.
- * Without these defines, ROV will encounter a Java exception when using an
- * autosized heap. This is a posted workaround for a known limitation of
- * RTSC/rta. See: https://bugs.eclipse.org/bugs/show_bug.cgi?id=487894
- *
- * Note: these do not affect placement in RAM or FLASH, they are only used
- * by ROV2, see the BLE Stack User's Guide for more info on a workaround
- * for ROV Classic
- *
- */
-__UNUSED_SRAM_start__ = RAM_BASE;
-__UNUSED_SRAM_end__ = RAM_BASE + RAM_SIZE;
-
-__UNUSED_FLASH_start__ = FLASH_BASE;
-__UNUSED_FLASH_end__ = FLASH_BASE + FLASH_SIZE;
-
 /*******************************************************************************
  * Main arguments
  */
@@ -221,48 +207,79 @@ __UNUSED_FLASH_end__ = FLASH_BASE + FLASH_SIZE;
  ******************************************************************************/
 MEMORY
 {
-  /* EDITOR'S NOTE:
-   * the FLASH and SRAM lengths can be changed by defining
-   * ICALL_STACK0_START or ICALL_RAM0_START in
-   * Properties->ARM Linker->Advanced Options->Command File Preprocessing.
-   */
-
   /* Application stored in and executes from internal flash */
   FLASH (RX) : origin = FLASH_START, length = (FLASH_END - FLASH_START + 1)
 
+  ENTRY (RX) : origin = ENTRY_START, length = ENTRY_SIZE
   /* CCFG Page, contains .ccfg code section and some application code. */
-  FLASH_LAST_PAGE (RX) :  origin = FLASH_LAST_PAGE_START, length = PAGE_SIZE
+#ifndef OAD_IMG_A
+  FLASH_IMG_HDR (RX) : origin = OAD_HDR_START, length = OAD_HDR_SIZE
+#endif
 
   /* Application uses internal RAM for data */
 #if (defined(FLASH_ROM_BUILD) && (FLASH_ROM_BUILD == 2))
   RTOS_SRAM (RWX) : origin = RTOS_RAM_START, length = (RTOS_RAM_END - RTOS_RAM_START + 1)
 #endif
   SRAM (RWX) : origin = RAM_START, length = (RAM_END - RAM_START + 1)
-
-  #ifdef CACHE_AS_RAM
-      GPRAM(RWX) : origin = GPRAM_START, length = GPRAM_SIZE
-  #endif /* CACHE_AS_RAM */
 }
-
 /*******************************************************************************
  * Section Allocation in Memory
  ******************************************************************************/
 SECTIONS
 {
-  .intvecs        :   >  FLASH_START
-  .text           :   >> FLASH | FLASH_LAST_PAGE
-  .const          :   >> FLASH | FLASH_LAST_PAGE
-  .constdata      :   >> FLASH | FLASH_LAST_PAGE
-  .rodata         :   >> FLASH | FLASH_LAST_PAGE
-  .cinit          :   >  FLASH | FLASH_LAST_PAGE
-  .pinit          :   >> FLASH | FLASH_LAST_PAGE
-  .init_array     :   >  FLASH | FLASH_LAST_PAGE
-  .emb_text       :   >> FLASH | FLASH_LAST_PAGE
-  .ccfg           :   >  FLASH_LAST_PAGE (HIGH)
+ #ifdef OAD_IMG_A
+  GROUP >  FLASH(HIGH)
+  {
+    .image_header align PAGE_SIZE
+    .text
+    .const
+    .constdata
+    .rodata
+    .emb_text
+    .init_array
+    .cinit
+    .pinit
+  }LOAD_END(flashEndAddr)
+
+  GROUP > ENTRY
+  {
+    .resetVecs
+    .intvecs
+    EntrySection  LOAD_START(prgEntryAddr)
+  }
+
+#else   // OAD_IMG_B || OAD_IMG_E
+  GROUP > FLASH_IMG_HDR
+  {
+    .image_header align PAGE_SIZE
+  }
+
+  GROUP > ENTRY
+  {
+    .resetVecs
+    .intvecs
+    EntrySection  LOAD_START(prgEntryAddr)
+  }
+
+  GROUP >  FLASH
+  {
+    .text
+    .const
+    .constdata
+    .rodata
+    .emb_text
+    .init_array
+    .cinit
+    .pinit        LOAD_END(flashEndAddr)
+  }
+
+  //.cinit        : > FLASH LOAD_END(flashEndAddr)
+
+#endif // OAD_IMG_A
 
   GROUP > SRAM
   {
-    .data
+    .data LOAD_START(ramStartHere)
     #ifndef CACHE_AS_RAM
     .bss
     #endif /* CACHE_AS_RAM */
@@ -271,15 +288,6 @@ SECTIONS
     vtable_ram
     .sysmem
     .nonretenvar
-    /*This keeps ll.o objects out of GPRAM, if no ll.o would be placed here
-      the warning #10068 is supressed.*/
-    #ifdef CACHE_AS_RAM
-    ll_bss
-    {
-      --library=*ll_*.a<ll.o> (.bss)
-      --library=*ll_*.a<ll_ae.o> (.bss)
-    }
-    #endif /* CACHE_AS_RAM */
   } LOAD_END(heapStart)
 
   .stack            :   >  SRAM (HIGH) LOAD_START(heapEnd)
