@@ -57,7 +57,7 @@
 #include <ti/sysbios/knl/Queue.h>
 
 #include <ti/display/Display.h>
-//#include <ti/drivers/GPIO.h>
+#include <ti/drivers/GPIO.h>
 #include <ti/drivers/PIN.h>
 #include <ti/drivers/I2C.h>
 #include <ti/drivers/SPI.h>
@@ -66,7 +66,7 @@
 //#include <ti/display/Display.h>
 #include <ti/display/DisplayUart.h>
 #include <ti/drivers/sd/SDSPI.h>
-//#include <ti/drivers/apps/LED.h>
+#include <ti/drivers/apps/LED.h>
 
 #if !(defined __TI_COMPILER_VERSION__)
 #include <intrinsics.h>
@@ -76,12 +76,22 @@
 
 #include <icall.h>
 #include "util.h"
+#include "onboard.h"
 #include <bcomdef.h>
 /* This Header file contains all BLE API and icall structure definition */
 #include <icall_ble_api.h>
 
 #include <devinfoservice.h>
-//#include <simple_gatt_profile.h>
+//#include <custom_gatt_profile.h>
+
+// Used for OAD Reset Service APIs
+#include "oad_reset_service.h"
+
+// Needed for HAL_SYSTEM_RESET()
+
+//#include "hal_mcu.h"
+//#include "peripheral.h"
+
 #include <Profiles/custom_gatt_profile.h>
 #include <driverlib/aon_ioc.h>
 
@@ -89,15 +99,27 @@
 #include <rcosc_calibration.h>
 #endif //USE_RCOSC
 
-#include <ti_drivers_config.h>
+#include <ti/zstack/boards/CC26X2R1_LAUNCHXL/ti_drivers_config.h>
 //#include <board_key.h>
 
 //#include <menu/two_btn_menu.h>
 
-//#include "simple_peripheral_menu.h"
+
 #include "custom_peripheral.h"
 #include "ti_ble_config.h"
-//#include "myGPIOs.h"
+#ifdef LED_DEBUG
+#include <ti/drivers/PIN.h>
+#endif //LED_DEBUG
+
+
+// Used for imgHdr_t structure
+#include <common/cc26xx/oad/oad_image_header.h>
+#include "oad.h"
+#include <common/cc26xx/flash_interface/flash_interface.h>
+#include DeviceFamily_constructPath(driverlib/sys_ctrl.h)
+#include <ti/devices/DeviceFamily.h>
+
+#include "myGPIOs.h"
 
 
 #ifdef PTM_MODE
@@ -117,6 +139,9 @@
 // How often to perform periodic event (in ms)
 #define CP_PERIODIC_EVT_PERIOD               1000
 
+// Offset into the scanRspData string the software version info is stored
+#define OAD_SOFT_VER_OFFSET                   15
+
 // Task configuration
 #define CP_TASK_PRIORITY                     1
 
@@ -135,6 +160,11 @@
 #define CP_READ_RPA_EVT                      7
 #define CP_SEND_PARAM_UPDATE_EVT             8
 #define CP_CONN_EVT                          9
+#define CP_OAD_RESET_EVT                     10
+
+#define CP_OAD_QUEUE_EVT                     OAD_QUEUE_EVT       // Event_Id_01
+#define CP_OAD_COMPLETE_EVT                  OAD_DL_COMPLETE_EVT // Event_Id_02
+#define CP_OAD_NO_MEM_EVT                    OAD_OUT_OF_MEM_EVT  // Event_Id_03
 
 // Internal Events for RTOS application
 #define CP_ICALL_EVT                         ICALL_MSG_EVENT_ID // Event_Id_31
@@ -142,7 +172,10 @@
 
 // Bitwise OR of all RTOS events to pend on
 #define CP_ALL_EVENTS                        (CP_ICALL_EVT             | \
-                                              CP_QUEUE_EVT)
+                                              CP_QUEUE_EVT             | \
+                                              CP_OAD_QUEUE_EVT         | \
+                                              CP_OAD_COMPLETE_EVT      | \
+                                              CP_OAD_NO_MEM_EVT)
 
 // Size of string-converted device address ("0xXXXXXXXXXXXX")
 #define CP_ADDR_STR_SIZE     15
@@ -175,7 +208,7 @@
 #define AUTO_PHY_UPDATE            0xFF
 
 // Spin if the expression is not true
-#define CUSTOMPERIPHERAL_ASSERT(expr) if (!(expr)) simple_peripheral_spin();
+#define CUSTOMPERIPHERAL_ASSERT(expr) if (!(expr)) custom_peripheral_spin();
 
 /*********************************************************************
  * TYPEDEFS
@@ -267,6 +300,8 @@ typedef struct
 // Display Interface
 Display_Handle dispHandle = NULL;
 
+extern const imgHdr_t _imgHdr;
+
 // Task configuration
 Task_Struct cpTask;
 #if defined __TI_COMPILER_VERSION__
@@ -275,6 +310,9 @@ Task_Struct cpTask;
 #pragma data_alignment=8
 #endif
 uint8_t cpTaskStack[CP_TASK_STACK_SIZE];
+
+//reset connection handle
+uint16_t resetConnHandle = LINKDB_CONNHANDLE_INVALID;
 
 /*********************************************************************
  * LOCAL VARIABLES
@@ -329,6 +367,27 @@ static List_List paramUpdateList;
 // Auto connect Disabled/Enabled {0 - Disabled, 1- Group A , 2-Group B, ...}
 uint8_t autoConnect = AUTOCONNECT_DISABLE;
 
+// Variable used to store the number of messages pending once OAD completes
+// The application cannot reboot until all pending messages are sent
+static uint8_t numPendingMsgs = 0;
+static bool oadWaitReboot = false;
+
+// Flag to be stored in NV that tracks whether service changed
+// indications needs to be sent out
+static uint32_t  sendSvcChngdOnNextBoot = FALSE;
+
+#ifdef LED_DEBUG
+// State variable for debugging LEDs
+static PIN_State sbpLedState;
+
+// Pin table for LED debug pins
+static const PIN_Config sbpLedPins[] = {
+    CONFIG_PIN_0 | PIN_GPIO_OUTPUT_EN | PIN_GPIO_LOW | PIN_PUSHPULL | PIN_DRVSTR_MAX,       //red led
+    CONFIG_PIN_1 | PIN_GPIO_OUTPUT_EN | PIN_GPIO_LOW | PIN_PUSHPULL | PIN_DRVSTR_MAX,    //green led
+    PIN_TERMINATE
+};
+#endif //LED_DEBUG
+
 // Advertising handles
 static uint8_t advHandleLegacy;
 static uint8_t advHandleLongRange;
@@ -369,8 +428,11 @@ static void CustomPeripheral_processPairState(cpPairStateData_t *pPairState);
 static void CustomPeripheral_processPasscode(cpPasscodeData_t *pPasscodeData);
 static void CustomPeripheral_charValueChangeCB(uint8_t paramId);
 static status_t CustomPeripheral_enqueueMsg(uint8_t event, void *pData);
+void CustomPeripheral_processOadResetWriteCB(uint16_t connHandle,
+                                             uint16_t bim_var);
 //static void CustomPeripheral_keyChangeHandler(uint8_t keys);
 static void CustomPeripheral_handleKeys(uint8_t keys);
+static void CustomPeripheral_processOadResetEvt(oadResetWrite_t *resetEvt);
 static void CustomPeripheral_processCmdCompleteEvt(hciEvt_CmdComplete_t *pMsg);
 static void CustomPeripheral_initPHYRSSIArray(void);
 static void CustomPeripheral_updatePHYStat(uint16_t eventCode, uint8_t *pMsg);
@@ -378,6 +440,7 @@ static uint8_t CustomPeripheral_addConn(uint16_t connHandle);
 static uint8_t CustomPeripheral_getConnIndex(uint16_t connHandle);
 static uint8_t CustomPeripheral_removeConn(uint16_t connHandle);
 static void CustomPeripheral_processParamUpdate(uint16_t connHandle);
+static uint8_t CustomPeripheral_processL2CAPMsg(l2capSignalEvent_t *pMsg);
 static status_t CustomPeripheral_startAutoPhyChange(uint16_t connHandle);
 static status_t CustomPeripheral_stopAutoPhyChange(uint16_t connHandle);
 static status_t CustomPeripheral_setPhy(uint16_t connHandle, uint8_t allPhys,
@@ -389,8 +452,8 @@ static uint8_t CustomPeripheral_clearConnListEntry(uint16_t connHandle);
 static void CustomPeripheral_connEvtCB(Gap_ConnEventRpt_t *pReport);
 static void CustomPeripheral_processConnEvt(Gap_ConnEventRpt_t *pReport);
 #ifdef PTM_MODE
-void simple_peripheral_handleNPIRxInterceptEvent(uint8_t *pMsg);  // Declaration
-static void simple_peripheral_sendToNPI(uint8_t *buf, uint16_t len);  // Declaration
+void custom_peripheral_handleNPIRxInterceptEvent(uint8_t *pMsg);  // Declaration
+static void custom_peripheral_sendToNPI(uint8_t *buf, uint16_t len);  // Declaration
 #endif // PTM_MODE
 
 
@@ -416,18 +479,23 @@ static BLE_CBs_t CustomPeripheral_CBs =
   CustomPeripheral_charValueChangeCB // Custom GATT Characteristic value change callback
 };
 
+static oadResetWriteCB_t CustomPeripheral_oadResetCBs =
+{
+  CustomPeripheral_processOadResetWriteCB // Write Callback.
+};
+
 /*********************************************************************
  * PUBLIC FUNCTIONS
  */
 
 /*********************************************************************
- * @fn      simple_peripheral_spin
+ * @fn      custom_peripheral_spin
  *
  * @brief   Spin forever
  *
  * @param   none
  */
-static void simple_peripheral_spin(void)
+static void custom_peripheral_spin(void)
 {
   volatile uint8_t x = 0;
 
@@ -439,7 +507,7 @@ static void simple_peripheral_spin(void)
 
 #ifdef PTM_MODE
 /*********************************************************************
-* @fn      simple_peripheral_handleNPIRxInterceptEvent
+* @fn      custom_peripheral_handleNPIRxInterceptEvent
 *
 * @brief   Intercept an NPI RX serial message and queue for this application.
 *
@@ -447,7 +515,7 @@ static void simple_peripheral_spin(void)
 *
 * @return  none.
 */
-void simple_peripheral_handleNPIRxInterceptEvent(uint8_t *pMsg)
+void custom_peripheral_handleNPIRxInterceptEvent(uint8_t *pMsg)
 {
  // Send Command via HCI TL
  HCI_TL_SendToStack(((NPIMSG_msg_t *)pMsg)->pBuf);
@@ -460,7 +528,7 @@ void simple_peripheral_handleNPIRxInterceptEvent(uint8_t *pMsg)
 }
 
 /*********************************************************************
-* @fn      simple_peripheral_sendToNPI
+* @fn      custom_peripheral_sendToNPI
 *
 * @brief   Create an NPI packet and send to NPI to transmit.
 *
@@ -470,7 +538,7 @@ void simple_peripheral_handleNPIRxInterceptEvent(uint8_t *pMsg)
 *
 * @return  none
 */
-static void simple_peripheral_sendToNPI(uint8_t *buf, uint16_t len)
+static void custom_peripheral_sendToNPI(uint8_t *buf, uint16_t len)
 {
  npiPkt_t *pNpiPkt = (npiPkt_t *)ICall_allocMsg(sizeof(npiPkt_t) + len);
 
@@ -528,6 +596,43 @@ static void CustomPeripheral_init(void)
   // so that the application can send and receive messages.
   ICall_registerApp(&selfEntity, &syncEvent);
 
+#ifdef LED_DEBUG
+  // Open the LED debug pins
+  if (!PIN_open(&sbpLedState, sbpLedPins))
+  {
+    Display_print0(dispHandle, 0, 0, "Debug PINs failed to open");
+  }
+  else
+  {
+    PIN_Id activeLed;
+    uint8_t blinkCnt = 9;
+
+    PIN_setOutputValue(&sbpLedState, CONFIG_PIN_0, 0);
+    PIN_setOutputValue(&sbpLedState, CONFIG_PIN_1, 0);
+
+    if (blinkCnt < 12)
+    {
+      activeLed = CONFIG_PIN_0;
+    }
+    else
+    {
+      activeLed = CONFIG_PIN_1;
+    }
+
+    for(uint8_t numBlinks = 0; numBlinks < blinkCnt; ++numBlinks)
+    {
+      PIN_setOutputValue(&sbpLedState, activeLed, !PIN_getOutputValue(activeLed));
+
+      // Sleep for 100ms, sys-tick for BLE-Stack is 10us,
+      // Task sleep is in # of ticks
+      Task_sleep(10000);
+    }
+
+    // Close the pins after using
+    PIN_close(&sbpLedState);
+  }
+#endif //LED_DEBUG
+
 #ifdef USE_RCOSC
   // Set device's Sleep Clock Accuracy
 #if ( HOST_CONFIG & ( CENTRAL_CFG | PERIPHERAL_CFG ) )
@@ -543,6 +648,8 @@ static void CustomPeripheral_init(void)
   Util_constructClock(&clkPeriodic, CustomPeripheral_clockHandler,
                       CP_PERIODIC_EVT_PERIOD, 0, false, (UArg)&argPeriodic);
 
+  uint8_t swVer[OAD_SW_VER_LEN];
+  OAD_getSWVersion(swVer, OAD_SW_VER_LEN);
   // The type of display is configured based on the BOARD_DISPLAY_USE...
   // preprocessor definitions
   dispHandle = Display_open(Display_Type_ANY, NULL);
@@ -640,10 +747,10 @@ static void CustomPeripheral_init(void)
 
 #ifdef PTM_MODE
   // Intercept NPI RX events.
-  NPITask_registerIncomingRXEventAppCB(simple_peripheral_handleNPIRxInterceptEvent, INTERCEPT);
+  NPITask_registerIncomingRXEventAppCB(custom_peripheral_handleNPIRxInterceptEvent, INTERCEPT);
 
   // Register for Command Status information
-  HCI_TL_Init(NULL, (HCI_TL_CommandStatusCB_t) simple_peripheral_sendToNPI, NULL, selfEntity);
+  HCI_TL_Init(NULL, (HCI_TL_CommandStatusCB_t) custom_peripheral_sendToNPI, NULL, selfEntity);
 
   // Register for Events
   HCI_TL_getCmdResponderID(ICall_getLocalMsgEntityId(ICALL_SERVICE_CLASS_BLE_MSG, selfEntity));
@@ -722,6 +829,55 @@ static void CustomPeripheral_taskFxn(UArg a0, UArg a1)
           }
         }
       }
+      // OAD events
+     if(events & CP_OAD_NO_MEM_EVT)
+     {
+       // The OAD module is unable to allocate memory, print failure, cancel OAD
+       Display_print0(dispHandle, CP_ROW_STATUS_1, 0,
+                         "OAD malloc fail, cancelling OAD");
+       OAD_cancel();
+
+#ifdef LED_DEBUG
+       // Diplay is not enabled in persist app so use LED
+       if(PIN_open(&sbpLedState, sbpLedPins))
+       {
+         PIN_setOutputValue(&sbpLedState, CONFIG_PIN_0, 1);
+       }
+#endif //LED_DEBUG
+       }
+        // OAD queue processing
+       if(events & CP_OAD_QUEUE_EVT)
+       {
+         // Process the OAD Message Queue
+         uint8_t status = OAD_processQueue();
+
+         // If the OAD state machine encountered an error, print it
+         // Return codes can be found in oad_constants.h
+         if(status == OAD_DL_COMPLETE)
+         {
+           Display_print0(dispHandle, CP_ROW_STATUS_1, 0, "OAD DL Complete, wait for Enable");
+         }
+         else if(status == OAD_IMG_ID_TIMEOUT)
+         {
+           Display_print0(dispHandle, CP_ROW_STATUS_1, 0, "ImgID Timeout, disconnecting");
+
+           // This may be an attack, terminate the link,
+           // Note HCI_DISCONNECT_REMOTE_USER_TERM seems to most closet reason for
+           // termination at this state
+           MAP_GAP_TerminateLinkReq(OAD_getactiveCxnHandle(), HCI_DISCONNECT_REMOTE_USER_TERM);
+         }
+         else if(status != OAD_SUCCESS)
+         {
+           Display_print1(dispHandle, CP_ROW_STATUS_1, 0, "OAD Error: %d", status);
+         }
+
+       }
+
+       if(events & CP_OAD_COMPLETE_EVT)
+       {
+         // Register for L2CAP Flow Control Events
+         L2CAP_RegisterFlowCtrlTask(selfEntity);
+       }
     }
   }
 }
@@ -834,6 +990,11 @@ static uint8_t CustomPeripheral_processStackMsg(ICall_Hdr *pMsg)
       break;
     }
 
+    case L2CAP_SIGNAL_EVENT:
+      // Process L2CAP signal
+      safeToDealloc = CustomPeripheral_processL2CAPMsg((l2capSignalEvent_t *)pMsg);
+      break;
+
     default:
       // do nothing
       break;
@@ -864,7 +1025,7 @@ static uint8_t CustomPeripheral_processStackMsg(ICall_Hdr *pMsg)
     }
 
     // Send to Remote Host.
-    simple_peripheral_sendToNPI(pBuf->pData, len);
+    custom_peripheral_sendToNPI(pBuf->pData, len);
 
     // Free buffers if needed.
     switch (pBuf->pData[0])
@@ -877,6 +1038,62 @@ static uint8_t CustomPeripheral_processStackMsg(ICall_Hdr *pMsg)
     }
   }
 #endif // PTM_MODE
+
+  return (safeToDealloc);
+}
+
+/*********************************************************************
+ * @fn      customPeripheral_processL2CAPMsg
+ *
+ * @brief   Process L2CAP messages and events.
+ *
+ * @return  TRUE if safe to deallocate incoming message, FALSE otherwise.
+ */
+static uint8_t CustomPeripheral_processL2CAPMsg(l2capSignalEvent_t *pMsg)
+{
+  uint8_t safeToDealloc = TRUE;
+  static bool firstRun = TRUE;
+
+  switch (pMsg->opcode)
+  {
+    case L2CAP_NUM_CTRL_DATA_PKT_EVT:
+    {
+      /*
+      * We cannot reboot the device immediately after receiving
+      * the enable command, we must allow the stack enough time
+      * to process and respond to the OAD_EXT_CTRL_ENABLE_IMG
+      * command. This command will determine the number of
+      * packets currently queued up by the LE controller.
+      * BIM var is already set via OadPersistApp_processOadWriteCB
+      */
+      if(firstRun)
+      {
+        firstRun = false;
+
+        // We only want to set the numPendingMsgs once
+        numPendingMsgs = MAX_NUM_PDU - pMsg->cmd.numCtrlDataPktEvt.numDataPkt;
+
+        // Wait until all PDU have been sent on cxn events
+        Gap_RegisterConnEventCb(CustomPeripheral_connEvtCB,
+                                  GAP_CB_REGISTER,
+                                  resetConnHandle);
+                                  //OAD_getactiveCxnHandle());
+                                  //pMsg->connHandle);
+                                  //0);
+
+        /* Set the flag so that the connection event callback will
+         * be processed in the context of a pending OAD reboot
+         */
+        oadWaitReboot = true;
+      }
+
+      break;
+    }
+
+    default:
+      // do nothing
+      break;
+  }
 
   return (safeToDealloc);
 }
@@ -902,6 +1119,7 @@ static uint8_t CustomPeripheral_processGATTMsg(gattMsgEvent_t *pMsg)
   else if (pMsg->method == ATT_MTU_UPDATED_EVENT)
   {
     // MTU size updated
+    OAD_setBlockSize(pMsg->msg.mtuEvt.MTU);
     Display_printf(dispHandle, CP_ROW_STATUS_1, 0, "MTU Size: %d", pMsg->msg.mtuEvt.MTU);
   }
 
@@ -969,6 +1187,10 @@ static void CustomPeripheral_processAppMsg(cpEvt_t *pMsg)
 
     case CP_CONN_EVT:
       CustomPeripheral_processConnEvt((Gap_ConnEventRpt_t *)(pMsg->pData));
+      break;
+
+    case CP_OAD_RESET_EVT:
+      CustomPeripheral_processOadResetEvt((oadResetWrite_t *)(pMsg->pData));
       break;
 
     default:
@@ -1235,6 +1457,21 @@ static void CustomPeripheral_processGapMessage(gapEventHdr_t *pMsg)
       Display_clearLines(dispHandle, CP_ROW_STATUS_1, CP_ROW_STATUS_2);
       break;
   }
+}
+
+/*********************************************************************
+ * @fn      CustomPeripheral_processOadWriteCB
+ *
+ * @brief   Process a write request to the OAD reset service
+ *
+ * @param   connHandle - the connection Handle this request is from.
+ * @param   bim_var    - bim_var to set before resetting.
+ *
+ * @return  None.
+ */
+void CustomPeripheral_processOadWriteCB(uint8_t event, uint16_t arg)
+{
+  Event_post(syncEvent, event);
 }
 
 /*********************************************************************
@@ -1646,20 +1883,40 @@ static void CustomPeripheral_connEvtCB(Gap_ConnEventRpt_t *pReport)
  */
 static void CustomPeripheral_processConnEvt(Gap_ConnEventRpt_t *pReport)
 {
-  // Get index from handle
-  uint8_t connIndex = CustomPeripheral_getConnIndex(pReport->handle);
+    // Get index from handle
+    uint8_t connIndex = CustomPeripheral_getConnIndex(pReport->handle);
+    /* If we are waiting for an OAD Reboot, process connection events to ensure
+     * that we are not waiting to send data before restarting
+     */
+    if(oadWaitReboot)
+    {
+        // Wait until all pending messages are sent
+        if(numPendingMsgs == 0)
+        {
+            // Reset the system
+            SysCtrlSystemReset();
+        }
+        else
+        {
+          numPendingMsgs--;
+        }
+    }
+    else
+    {
+      // Process connection events normally
+        if (connIndex >= MAX_NUM_BLE_CONNS)
+        {
+          Display_printf(dispHandle, CP_ROW_STATUS_1, 0, "Connection handle is not in the connList !!!");
+          return;
+        }
 
-  if (connIndex >= MAX_NUM_BLE_CONNS)
-  {
-    Display_printf(dispHandle, CP_ROW_STATUS_1, 0, "Connection handle is not in the connList !!!");
-    return;
-  }
+        // If auto phy change is enabled
+        if (connList[connIndex].isAutoPHYEnable == TRUE)
+        {
+          // Read the RSSI
+          HCI_ReadRssiCmd(pReport->handle);
+        }
 
-  // If auto phy change is enabled
-  if (connList[connIndex].isAutoPHYEnable == TRUE)
-  {
-    // Read the RSSI
-    HCI_ReadRssiCmd(pReport->handle);
   }
 }
 
@@ -2159,6 +2416,20 @@ static void CustomPeripheral_processCmdCompleteEvt(hciEvt_CmdComplete_t *pMsg)
         Display_printf(dispHandle, CP_ROW_RSSI + 2, 0, "RXPh: %d, TXPh: %d",
                        pMsg->pReturnParam[3], pMsg->pReturnParam[4]);
       }
+        break;
+      }
+
+      case HCI_LE_READ_LOCAL_RESOLVABLE_ADDRESS:
+      {
+        uint8_t* pRpaNew = &(pMsg->pReturnParam[1]);
+
+        if (memcmp(pRpaNew, rpa, B_ADDR_LEN))
+        {
+          // If the RPA has changed, update the display
+          Display_printf(dispHandle, CP_ROW_RPA, 0, "RP Addr: %s",
+                         Util_convertBdAddr2Str(pRpaNew));
+          memcpy(rpa, pRpaNew, B_ADDR_LEN);
+      }
       break;
     }
 
@@ -2521,4 +2792,66 @@ static void CustomPeripheral_performPeriodicTask(void)
     i++;
 }
 
+/*********************************************************************
+ * @fn      CustomPeripheral_processOadResetEvt
+ *
+ * @brief   Process a write request to the OAD reset service
+ *
+ * @param   resetEvt - The oadResetWrite_t struct containing reset data
+ *
+ * @return  None.
+ */
+static void CustomPeripheral_processOadResetEvt(oadResetWrite_t *resetEvt)
+{
+  /* We cannot reboot the device immediately after receiving
+   * the enable command, we must allow the stack enough time
+   * to process and responsd to the OAD_EXT_CTRL_ENABLE_IMG
+   * command. The current implementation will wait one cxn evt
+   */
+  // Register for L2CAP Flow Control Events
+  L2CAP_RegisterFlowCtrlTask(selfEntity);
+
+  resetConnHandle = resetEvt->connHandle;
+
+  uint8_t status = FLASH_FAILURE;
+  //read the image validation bytes and set it appropriately.
+  imgHdr_t imgHdr = {0};
+  if(flash_open())
+  {
+    status = readFlash(0x0, (uint8_t *)&imgHdr, OAD_IMG_HDR_LEN);
+  }
+
+  if ((FLASH_SUCCESS == status) && ( imgHdr.fixedHdr.imgVld != 0))
+  {
+    if ( OAD_evenBitCount(imgHdr.fixedHdr.imgVld) )
+    {
+      imgHdr.fixedHdr.imgVld = imgHdr.fixedHdr.imgVld << 1;
+      writeFlash((uint32_t)FLASH_ADDRESS(0, IMG_VALIDATION_OFFSET),
+                 (uint8_t *)&(imgHdr.fixedHdr.imgVld), sizeof(imgHdr.fixedHdr.imgVld));
+    }
+  }
+}
+
+/*********************************************************************
+ * @fn      customPeripheral_processOadResetWriteCB
+ *
+ * @brief   Process a write request to the OAD reset service
+ *
+ * @param   connHandle - the connection Handle this request is from.
+ * @param   bim_var    - bim_var to set before resetting.
+ *
+ * @return  None.
+ */
+void customPeripheral_processOadResetWriteCB(uint16_t connHandle,
+                                      uint16_t bim_var)
+{
+    // Allocate memory for OAD EVT payload, the app task must free this later
+    oadResetWrite_t *oadResetWriteEvt = ICall_malloc(sizeof(oadResetWrite_t));
+
+    oadResetWriteEvt->connHandle = connHandle;
+    oadResetWriteEvt->bim_var = bim_var;
+
+    // This function will enqueue the messsage and wake the application
+    customPeripheral_enqueueMsg(CP_OAD_RESET_EVT, (uint8_t *)oadResetWriteEvt);
+}
 
